@@ -1,0 +1,33 @@
+void Game::render()
+{
+    if(m_state == GAME_ACTIVE)
+    {
+
+        m_colorbuffer.bind(sp::Colorbuffer::Attachment::ColorAttachment2);
+        m_controller->draw(m_background);
+
+        m_levels[m_level].draw(m_controller);
+        m_controller->draw(player->sprite);
+        for(PowerUp& pw : m_power_ups)
+        {
+            if(!pw.destroyed)
+            {
+                m_controller->draw(pw.sprite);
+            }
+        }
+
+        generator->draw(m_controller);
+        m_controller->draw(ball->sprite);
+        m_colorbuffer.display(sp::Colorbuffer::Attachment::ColorAttachment2);
+
+
+        sp::States states;
+        static sp::Sprite sprite;
+
+        const sp::Texture& texture = m_colorbuffer.getColorTexture(sp::Colorbuffer::Attachment::ColorAttachment2);
+
+        sprite.setTexture(texture);
+        states.shader  = &m_frame_shader;
+        m_controller->draw(sprite, states);
+    }
+}

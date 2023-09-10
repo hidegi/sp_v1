@@ -1,0 +1,68 @@
+void Game::render()
+{
+    if(m_state == GAME_ACTIVE)
+    {
+        ///draws silhouette to framebuffer..
+        m_framebuffer.bind();
+        m_framebuffer.clear(sp::Color{0, 0, 0, 255});
+        /*
+        //m_controller->draw(m_background);
+        light_area->draw(m_controller, *radialLight);
+        m_framebuffer.display();
+        m_framebuffer.clear();
+
+        //processor->beginRender();
+        //light_area->clear();
+        */
+
+
+        m_controller->draw(m_background);
+
+        m_levels[m_level].draw(m_controller);
+        m_controller->draw(player->sprite);
+        for(PowerUp& pw : m_power_ups)
+        {
+            if(!pw.destroyed)
+            {
+                m_controller->draw(pw.sprite);
+            }
+        }
+
+        generator->draw(m_controller);
+        m_controller->draw(ball->sprite);
+
+        //m_controller->draw(*radialLight);
+
+        //processor->endRender();
+        //m_controller->draw(*light_area);
+
+        m_framebuffer.display();
+        //m_framebuffer.clear();
+
+        /*
+        sp::States states;
+        states.shader = &m_frame_shader;
+        m_controller->draw(m_backscreen_sprite, states);
+        */
+        //light_area->display();
+
+
+        sp::States states;
+        states.shader  = &m_frame_shader;
+        states.texture = &m_framebuffer.getColorTexture();
+        m_controller->draw(*light_area, states);    ///grid draw..
+
+        if(!confuse && !chaos)
+        {
+            m_framebuffer.bind();
+            m_framebuffer.clear(sp::Color{0, 0, 0, 200});
+            light_area->draw(m_controller, *radialLight);
+            m_framebuffer.display();
+            states.shader  = nullptr;
+            states.texture = &m_framebuffer.getColorTexture();
+            m_controller->draw(*light_area, states);    ///grid draw..
+        }
+
+        //processor->render(m_controller);
+    }
+}

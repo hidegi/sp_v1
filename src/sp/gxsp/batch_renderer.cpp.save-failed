@@ -1,0 +1,779 @@
+#include <sp/gxsp/batch_renderer.h>
+#include <sp/spgl.h>
+#include <atomic>
+#include <algorithm>
+namespace sp
+{
+    namespace
+    {
+        float frame_position[2 * 6] =
+        {
+            800.f, 600.f,
+            0.f, 0.f,
+            0.f, 600.f,
+            0.f, 0.f,
+            800.f, 0.f,
+            800.f, 600.f
+        };
+
+        SPuint8 frame_color[4 * 6] =
+        {
+            255, 255, 255, 255,
+            255, 255, 255, 255,
+            255, 255, 255, 255,
+            255, 255, 255, 255,
+            255, 255, 255, 255,
+            255, 255, 255, 255
+        };
+
+        float frame_tex_coords[2 * 6] =
+        {
+            1.f, 0.f,
+            0.f, 1.f,
+            0.f, 0.f,
+            0.f, 1.f,
+            1.f, 1.f,
+            1.f, 0.f
+        };
+
+        std::atomic<SPuint32>   idcounter;
+        unsigned int            jumper = 1;
+
+        unsigned int createID()
+        {
+            unsigned int value = idcounter.fetch_add(jumper); jumper = 1;
+            return value;
+        }
+
+        void deleteID(int id)
+        {
+            jumper = idcounter.load() - id;
+            idcounter.fetch_sub(jumper);
+        }
+
+        SPuint32 translateBlendFactor(Blending::SP_Factor factor)
+        {
+            switch(factor)
+            {
+                case Blending::Zero:                    return GL_ZERO;
+                case Blending::One:                     return GL_ONE;
+                case Blending::SrcColor:                return GL_SRC_COLOR;
+                case Blending::OneMinusSrcColor:        return GL_ONE_MINUS_SRC_COLOR;
+                case Blending::DstColor:                return GL_DST_COLOR;
+                case Blending::OneMinusDstColor:        return GL_ONE_MINUS_DST_COLOR;
+                case Blending::SrcAlpha:                return GL_SRC_ALPHA;
+                case Blending::OneMinusSrcAlpha:        return GL_ONE_MINUS_SRC_ALPHA;
+                case Blending::DstAlpha:                return GL_DST_ALPHA;
+                case Blending::OneMinusDstAlpha:        return GL_ONE_MINUS_DST_ALPHA;
+            }
+
+            return GL_ZERO;
+        }
+
+        SPuint32 translateBlendEquation(Blending::SP_Equation eq)
+        {
+            switch(eq)
+            {
+                case Blending::Add:             return GL_FUNC_ADD_EXT;
+                case Blending::Subtract:        return GL_FUNC_SUBTRACT_EXT;
+                case Blending::ReverseSubtract: return GL_FUNC_REVERSE_SUBTRACT_EXT;
+            }
+
+            return GL_FUNC_ADD_EXT;
+        }
+    }
+
+    Renderer::Renderer() :
+        m_size          {0, 0},
+        m_default_view  {},
+        m_custom_view   {},
+        m_vertex_count  {0},
+        m_index_count   {0},
+        m_max_index     {0},
+        m_max_zorder    {0},
+        m_particle_count{0},
+        m_index_refresh_count{1},
+        m_post_process_shader{nullptr}
+    {
+    }
+
+    Renderer::Renderer(unsigned width, unsigned height) :
+        m_size  {width, height},
+        m_default_view  {},
+        m_custom_view   {},
+        m_vertex_count  {0},
+        m_index_count   {0},
+        m_max_index     {0},
+        m_max_zorder    {0},
+        m_particle_count{0},
+        m_index_refresh_count{1},
+        m_post_process_shader{nullptr}
+    {
+    }
+
+    Renderer::~Renderer()
+    {
+    }
+
+    Renderer::Renderer(const vec2u& dim) :
+        Renderer(dim.x, dim.y)
+    {
+    }
+
+    void Renderer::setPostProcessShader(const sp::Shader* shader)
+    {
+        m_post_process_shader = shader;
+    }
+
+    unsigned int Renderer::getFramebufferTexHandleGL() const
+    {
+        return m_framebuffer.getTexHandleGL();
+    }
+
+    void Renderer::setFramebufferPosition(float x, float y)
+    {
+        //x 2 4 6
+        //y 3 7 9
+        frame_position[2] = frame_position[4] = frame_position[6] = x;
+        frame_position[3] = frame_position[7] = frame_position[9] = y;
+    }
+    void Renderer::setSurfaceSize(unsigned int width, unsigned int height)
+    {
+        m_size.x = width;
+        m_size.y = height;
+        frame_position[0] = frame_position[8] = frame_position[10] = (float)width;
+        frame_position[1] = frame_position[5] = frame_position[11] = (float)height;
+        if(!m_framebuffer.create(width, height))
+            SP_PRINT_WARNING("failed to create framebuffer");
+    }
+
+    void Renderer::setSurfaceSize(const vec2u& dim)
+    {
+        setSurfaceSize(dim.x, dim.y);
+    }
+
+    void Renderer::setViewport(const rectf& viewport)
+    {
+        m_custom_view.setViewport(viewport);
+        m_cache.viewport_change = true;
+    }
+
+    void Renderer::applyCurrentView()
+    {
+        m_custom_view.load();
+        m_cache.viewport_change = false;
+    }
+
+    void Renderer::applyBlending(const Blending& b)
+    {
+        if(GL_EXT_blend_func_separate_supported)
+        {
+            spCheck(glBlendFuncSeparateEXT(
+                translateBlendFactor(b.colorSrcFactor),
+                translateBlendFactor(b.colorDstFactor),
+                translateBlendFactor(b.alphaSrcFactor),
+                translateBlendFactor(b.alphaDstFactor)
+            ))
+        }
+        else
+        {
+            spCheck(glBlendFunc(
+                translateBlendFactor(b.colorSrcFactor),
+                translateBlendFactor(b.colorDstFactor)
+            ))
+        }
+
+        spCheck(glBlendEquationSeparateEXT(
+            translateBlendEquation(b.colorEquation),
+            translateBlendEquation(b.alphaEquation)
+        ))
+
+        m_cache.last_blend_mode = m_blend_mode;
+    }
+
+    void Renderer::initialize()
+    {
+        m_default_view.setViewport(
+            rectf{
+                0.f, 0.f,
+                static_cast<float>(m_size.x),
+                static_cast<float>(m_size.y),
+            });
+        m_custom_view = m_default_view;
+        m_cache.gl_states_set = false;
+        m_cache.viewport_change = true;
+    }
+
+    /**
+     *  because the fucking client loses a local variable's reference,
+     *  drawables must be stored in some persistent wrapper class (the sp, shared_ptr)..
+     */
+    void Renderer::addDrawable(const Drawable::Ptr primitive, bool set_max)
+    {
+        unsigned int first_index_count  = m_index_count;
+        unsigned int first_vertex_count = m_vertex_count;
+
+        m_vertex_count += primitive->m_vertices.size();
+        m_index_count  += primitive->m_indices.size();
+
+        m_max_zorder = std::max(m_max_zorder, primitive->m_zorder) + 1;
+        if(set_max)
+            primitive->m_zorder = m_max_zorder - 1;
+
+        Meta meta;
+        SPint32 id = createID();
+
+        meta.id             = primitive->m_id = id;
+        meta.first_index    = first_vertex_count;
+        meta.zorder         = primitive->m_zorder;
+        meta.drawable       = primitive;
+        meta.vertex_count   = primitive->m_vertices.size();
+        meta.index_count    = primitive->m_indices.size();
+        meta.vertex_entry   = first_vertex_count;
+        meta.index_entry    = first_index_count;
+        meta.toggle         = primitive->m_visible;
+        meta.texture        = primitive->m_texture;
+        meta.shader         = primitive->m_shader;
+        meta.primitive      = primitive->m_primitive_type;
+
+        m_drawables.push_back(meta);
+
+
+
+        m_positions.reserve(m_vertex_count);
+        m_colors.reserve(m_vertex_count);
+        m_tex_coords.reserve(m_vertex_count);
+        m_indices.reserve(m_index_count);
+
+        size_t i;
+      //  printf("new:\n");
+        for(i = 0; i < primitive->m_vertices.size(); i++)
+        {
+            const sp::Vertex& vertex = primitive->m_vertices[i];
+            m_positions.push_back(vertex.position);
+            //printf("pos: %f %f\n", vertex.position.x, vertex.position.y);
+            m_colors.push_back(vertex.color);
+            m_tex_coords.push_back(vertex.texCoords);
+        }
+
+        /*
+        for(i = 0; i < primitive->m_indices.size(); i++)
+        {
+            unsigned int index = primitive->m_indices[i] + first_vertex_count;
+            m_indices.push_back(index);
+        }
+        */
+        m_index_refresh_count = 1;
+    }
+
+    void Renderer::removeDrawable(const Drawable::Ptr primitive)
+    {
+        /*
+        if(!primitive) return;
+        unsigned int id = primitive->m_id;
+
+        Meta* meta  = nullptr;
+        auto it     = m_drawables.begin();
+        for(; it != m_drawables.end(); ++it)
+        {
+            Meta& found = *it;
+            if(id == found.id)
+            {
+                meta = &found;
+                break;
+            }
+        }
+
+        if(!meta)
+        {
+            printf("not found..\n");
+            return;
+        }
+
+        size_t start = meta->vertex_entry;
+        size_t end   = meta->vertex_entry + meta->vertex_count;
+
+        //printf("start: %lld, end: %lld, size: %lld\n", start, end, m_positions.size());
+        m_positions.erase(m_positions.begin() + start, m_positions.begin() + end);
+        m_colors.erase(m_colors.begin() + start, m_colors.begin() + end);
+        m_tex_coords.erase(m_tex_coords.begin() + start, m_tex_coords.begin() + end);
+
+
+        size_t count = meta->vertex_count;
+        /*
+        for(auto& m : m_drawables)
+        {
+            if(m.first_index >= (meta->first_index + count))
+                m.first_index -= count;
+        }
+
+        for(auto index_it = m_indices.begin(); index_it != m_indices.end(); ++index_it)
+        {
+            unsigned int index = *index_it;
+            if(index >= (meta->first_index + count))
+                *index_it -= count;
+        }
+        */
+
+        //0 1 2 3 4 5 6 7    8 9 10 11 12     13 14 15 16 17
+        //0 4 8
+
+        m_vertex_count  -= meta->vertex_count;
+        m_index_count   -= meta->index_count;
+
+        /*
+        if(!m_indices.empty())
+        {
+            auto end_it = m_indices.begin() + meta->index_entry;
+            m_indices.erase(end_it, end_it + meta->index_count);
+        }
+
+        m_drawables.erase(it);
+        deleteID(id);
+        m_index_refresh_count = 1;
+
+        Meta* previous = nullptr;
+        for(auto& m : m_drawables)
+        {
+            /*
+            //if(m.vertex_entry > meta->vertex_entry)
+                m.vertex_entry -= meta->vertex_count;
+
+            //if(m.index_entry > meta->index_entry)
+                m.index_entry -= meta->index_count;
+
+            m.vertex_entry = (previous) ? (previous->vertex_entry + previous->vertex_count) : 0;
+            m.index_entry  = (previous) ? (previous->index_entry  + previous->index_count) : 0;
+            m.first_index  = (previous) ? (previous->first_index  + previous->vertex_count) : 0;
+            previous = &m;
+        }
+        */
+    }
+
+    void Renderer::refresh()
+    {
+        for(auto& meta : m_drawables)
+        {
+            if(!meta.drawable.lock() || meta.drawable.expired())
+                continue;
+
+            auto ptr = meta.drawable.lock();
+            if(meta.toggle != ptr->m_visible)
+            {
+                m_index_refresh_count = 1;
+                meta.toggle = ptr->m_visible;
+            }
+        }
+
+        static std::vector<Meta> sorter;
+        if(m_index_refresh_count > 0 )
+        {
+            sorter.clear();
+            m_indices.clear();
+            m_batches.clear();
+            m_index_count = 0;
+        }
+
+        Meta* previous = nullptr;
+
+        for(auto& meta : m_drawables)
+        {
+            if(!meta.drawable.lock() || meta.drawable.expired())
+                continue;
+
+            auto ptr = meta.drawable.lock();
+            meta.vertex_entry = (previous) ? (previous->vertex_entry + previous->vertex_count) : 0;
+            meta.index_entry  = (previous) ? (previous->index_entry  + previous->index_count) : 0;
+            meta.first_index  = (previous) ? (previous->first_index  + previous->vertex_count) : 0;
+            if(meta.zorder != ptr->m_zorder)
+            {
+                meta.zorder = ptr->m_zorder;
+                m_max_zorder = std::max(m_max_zorder, meta.zorder);
+            }
+
+            if(meta.vertex_count != ptr->m_vertices.size())
+            {
+                //for varying vertex counts (not tested yet)..
+                long int new_count      = static_cast<long int>(ptr->m_vertices.size());
+                long int old_count      = static_cast<long int>(meta.vertex_count);
+                long int difference     = (new_count - old_count);
+                m_vertex_count         += (difference);
+
+                meta.vertex_count       = static_cast<size_t>(new_count);
+                meta.index_count        = ptr->m_indices.size();
+                //meta.first_index        = m_vertex_count;
+
+                 const std::vector<Vertex>& vertices = ptr->m_vertices;
+                if(new_count > old_count)
+                {
+                    printf("add case..\n");
+                    m_positions.reserve(m_vertex_count);
+                    m_colors.reserve(m_vertex_count);
+                    m_tex_coords.reserve(m_vertex_count);
+
+                    // 0 1 2 3 4 5 6 7 8 9 10
+                    //   |
+                    // 0 x 1 2 3 4 5 6 7 8 9 10
+                    //     |
+                    // 0 x y 1 2 3 4 5 6 7 8 9 10
+
+                    for(size_t i = 0; i < meta.vertex_count; i++)
+                    {
+                        m_positions.insert(m_positions.begin() + meta.vertex_entry + i, vertices[i].position + ptr->m_position);
+                        m_colors.insert(m_colors.begin() + meta.vertex_entry + i, vertices[i].color);
+                        m_tex_coords.insert(m_tex_coords.begin() + meta.vertex_entry + i, vertices[i].texCoords);
+                    }
+                }
+                else //new_count < old_count..
+                {
+                    printf("lessen case..\n");
+                    m_positions.erase(m_positions.begin() + meta.vertex_entry + new_count, m_positions.begin() + meta.vertex_entry + old_count);
+                    m_colors.erase(m_colors.begin() + meta.vertex_entry + new_count, m_colors.begin() + meta.vertex_entry + old_count);
+                    m_tex_coords.erase(m_tex_coords.begin() + meta.vertex_entry + new_count, m_tex_coords.begin() + meta.vertex_entry + old_count);
+
+                    for(size_t i = 0; i < meta.vertex_count; i++)
+                    {
+                        const Vertex& vertex = vertices[i];
+                        m_positions  [i + meta.vertex_entry] = vertices[i].position + ptr->m_position;
+                        m_colors     [i + meta.vertex_entry] = vertices[i].color;
+                        m_tex_coords [i + meta.vertex_entry] = vertices[i].texCoords;
+                    }
+                }
+                ptr->m_update = false;
+            }
+
+            if(ptr->m_update)
+            {
+                //ok..
+                const std::vector<Vertex>& vertices = ptr->m_vertices;
+                size_t vertex_entry = meta.vertex_entry;
+                size_t length = vertices.size();
+
+                if(meta.vertex_count != length)
+                {
+                    SP_PRINT_WARNING("miscalculation");
+                    continue;
+                }
+                for(size_t i = 0; i < length; i++)
+                {
+                    const Vertex& vertex = vertices[i];
+                    m_positions  [i + vertex_entry] = vertex.position + ptr->m_position;
+                    m_colors     [i + vertex_entry] = vertex.color;
+                    m_tex_coords [i + vertex_entry] = vertex.texCoords;
+                }
+
+                ptr->m_update = false;
+            }
+
+            if(m_index_refresh_count > 0)
+            {
+                sorter.push_back(meta);
+                m_index_count += ptr->m_indices.size();
+            }
+
+            previous = &meta;
+        }
+
+        if(m_index_refresh_count > 0)
+        {
+            if(sorter.empty())
+            {
+                m_index_refresh_count = 0;
+                return;
+            }
+
+            m_index_count += m_particle_count;
+
+            m_indices.reserve(m_index_count);
+            --m_index_refresh_count;
+            static auto lmbd =
+            SP_LAMBDA_CAPTURE_EQ_THIS(const Meta& L, const Meta& R)->bool
+            {
+                int left_z = L.zorder;
+                int right_z = R.zorder;
+
+                m_max_zorder = std::max(left_z, (int)m_max_zorder);
+                m_max_zorder = std::max(right_z, (int)m_max_zorder);
+                const sp::Texture* lt = L.texture;
+                const sp::Texture* rt = R.texture;
+                unsigned int lh = lt ? lt->getHandleGL() : 0;
+                unsigned int rh = rt ? rt->getHandleGL() : 0;
+
+                if(left_z == right_z)
+                    return (lh < rh);
+
+                return (left_z < right_z);
+            };
+            std::sort(sorter.begin(), sorter.end(), lmbd);
+
+            Batch batch;
+            batch.texture       = nullptr;
+            batch.shader        = nullptr;
+            batch.index_start   = 0;
+            batch.index_count   = 0;
+
+            const sp::Texture* texture  = (*sorter.begin()).texture;
+            const sp::Shader* shader    = (*sorter.begin()).shader;
+            int primitive_type          = (*sorter.begin()).primitive;
+
+            unsigned int tex_obj        = texture ? texture->getHandleGL() : 0;
+            unsigned int shader_obj     = shader ? shader->getHandleGL() : 0;
+
+
+            unsigned int index_count    = 0;
+            unsigned int offset         = 0;
+
+
+            for(auto it = sorter.begin(); it != sorter.end(); ++it)
+            {
+                Meta meta = *it;
+                if(!meta.toggle) continue;
+
+                unsigned meta_tex = meta.texture ? meta.texture->getHandleGL() : 0;
+                unsigned meta_shader = meta.shader ? meta.shader->getHandleGL() : 0;
+
+                if(     tex_obj != meta_tex
+                   ||   shader_obj != meta_shader
+                   ||   meta.primitive != primitive_type
+                   )
+                {
+                    batch.texture       = texture;
+                    batch.index_start   = offset;
+                    batch.index_count   = index_count;
+                    batch.primitive     = primitive_type;
+                    batch.shader        = shader;
+                    texture             = meta.texture;
+                    shader              = meta.shader;
+                    tex_obj             = meta_tex;
+                    shader_obj          = meta_shader;
+                    primitive_type      = meta.primitive;
+
+                    offset             += index_count;
+                    index_count         = 0;
+                    m_batches.push_back(batch);
+                }
+
+                //const std::vector<unsigned int> indices = meta.drawable.lock()->m_indices;
+                for(size_t i = 0; i < meta.index_count; i++)
+                {
+                    unsigned index;
+                    if(meta.drawable.lock())
+                        index = meta.drawable.lock()->m_indices[i] + meta.first_index;
+                    else
+                        index = i + meta.first_index;
+
+                    m_indices.push_back(index);
+                    ++index_count;
+                }
+            }
+
+            batch.index_start   = offset;
+            batch.index_count   = index_count;
+            batch.texture       = texture;
+            batch.primitive     = primitive_type;
+            batch.shader        = shader;
+            m_batches.push_back(batch);
+        }
+    }
+
+    void Renderer::clear(const Color& color)
+    {
+        m_framebuffer.bind();
+        spCheck(glClearColor(color.r / 255.f, color.g / 255.f, color.b / 255.f, color.a / 255.f))
+        spCheck(glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT))
+    }
+
+    void Renderer::applyTexture(const Texture* texture)
+    {
+        sp::Texture::bind(texture, Texture::SP_Mapping::Normalized);
+        m_cache.last_texture = texture;
+    }
+
+    void Renderer::applyShader(const Shader* shader)
+    {
+        if(m_cache.last_shader == shader)
+            return;
+
+        sp::Shader::bind(shader);
+        m_cache.last_shader = shader;
+    }
+
+    void Renderer::resetStatesGL()
+    {
+        static bool shader_available = Shader::shader_objects_supported();
+        /*
+        if(Controller::active())
+        {
+        */
+
+        if(GL_ARB_multitexture_supported)
+        {
+            spCheck(glClientActiveTextureARB(GL_TEXTURE0_ARB))
+            spCheck(glActiveTextureARB(GL_TEXTURE0_ARB))
+        }
+
+        spCheck(glPointSize(5.f));
+        spCheck(glDisable(GL_CULL_FACE))
+        spCheck(glDisable(GL_LIGHTING))
+        spCheck(glDisable(GL_DEPTH_TEST))
+        spCheck(glDisable(GL_ALPHA_TEST))
+        spCheck(glEnable(GL_TEXTURE_2D))
+        spCheck(glEnable(GL_BLEND))
+        spCheck(glMatrixMode(GL_MODELVIEW))
+        spCheck(glLoadIdentity())
+        spCheck(glEnableClientState(GL_VERTEX_ARRAY))
+        spCheck(glEnableClientState(GL_COLOR_ARRAY))
+        spCheck(glEnableClientState(GL_TEXTURE_COORD_ARRAY))
+        m_cache.gl_states_set = true;
+        applyBlending(BlendAlpha);
+        applyTexture(NULL);
+        if(shader_available)
+            applyShader(NULL);
+
+        setViewport(rectf{m_custom_view.getOrigin(), m_custom_view.getSize()});
+
+        //}
+
+    }
+
+    void Renderer::setupDraw()
+    {
+        if(!m_cache.gl_states_set)
+            resetStatesGL();
+
+        spCheck(glMatrixMode(GL_MODELVIEW))
+        spCheck(glLoadIdentity())
+
+        if(m_cache.viewport_change)
+            applyCurrentView();
+        if(m_blend_mode != m_cache.last_blend_mode)
+            applyBlending(m_blend_mode);
+    }
+
+    void Renderer::cleanupDraw()
+    {
+        if(m_cache.last_shader)
+            applyShader(NULL);
+
+        if(m_cache.last_texture)
+        {
+            if(GL_ARB_multitexture_supported)
+            {
+                spCheck(glClientActiveTextureARB(GL_TEXTURE0_ARB))
+                spCheck(glActiveTextureARB(GL_TEXTURE0_ARB))
+            }
+            applyTexture(NULL);
+        }
+    }
+
+    void Renderer::draw()
+    {
+        //printf("ok 1..\n");
+        refresh();
+
+        if(!m_index_count || m_indices.empty())
+        {
+            return;
+        }
+        //printf("pos: %lld, colors: %lld, tcs: %lld\n", m_positions.size(), m_colors.size(), m_tex_coords.size());
+        setupDraw();
+        spCheck(glPushClientAttrib(GL_CLIENT_PIXEL_STORE_BIT | GL_CLIENT_VERTEX_ARRAY_BIT))
+        spCheck(glPushAttrib(GL_COLOR_BUFFER_BIT | GL_ENABLE_BIT | GL_TEXTURE_BIT))
+
+        spCheck(glVertexPointer(2, GL_FLOAT, 0, &m_positions[0]));
+        spCheck(glColorPointer(4, GL_UNSIGNED_BYTE, 0, &m_colors[0]));
+        spCheck(glTexCoordPointer(2, GL_FLOAT, 0, &m_tex_coords[0]));
+
+        /*
+        for(size_t i = 0; i < m_positions.size(); i++)
+        {
+            printf("pos: %f %f\n", m_tex_coords[i].x, m_tex_coords[i].y);
+        }
+        */
+
+        const sp::Texture*  texture = nullptr;
+        const sp::Shader*   shader  = nullptr;
+
+        /**
+         *  needed:
+         *  - particle batch..
+         *  - flag for point sprites..
+         */
+        for(auto& batch : m_batches)
+        {
+
+            if(shader != batch.shader)
+            {
+                shader = batch.shader;
+                applyShader(shader);
+            }
+            applyShader(batch.shader);
+            if(texture != batch.texture)
+            {
+                if(GL_ARB_multitexture_supported)
+                {
+                    spCheck(glClientActiveTextureARB(GL_TEXTURE0_ARB))
+                    spCheck(glActiveTextureARB(GL_TEXTURE0_ARB))
+                }
+                texture = batch.texture;
+                applyTexture(texture);
+            }
+
+
+            if(batch.primitive == GL_POINTS)
+            {
+                spCheck(glEnable(GL_POINT_SPRITE_ARB))
+                /*
+                glEnable(GL_BLEND);
+                spCheck(glBlendFunc(GL_SRC_COLOR, GL_ONE_MINUS_SRC_COLOR));
+                */
+                spCheck(glEnable(GL_LINE_SMOOTH));
+                spCheck(glEnable(GL_POINT_SMOOTH));
+                spCheck(glEnable(GL_POLYGON_SMOOTH));
+
+                //static float max;
+                //glGetFloatv(GL_MAX_POINT_SIZE, &max);
+
+                //glPointParameteri(GL_POINT_SPRITE_COORD_ORIGIN, GL_LOWER_LEFT);
+                glTexEnvi(GL_POINT_SPRITE_ARB, GL_COORD_REPLACE_ARB, GL_TRUE);
+
+                //spCheck(glDisable(GL_BLEND))
+            }
+
+            spCheck(glDrawElements(batch.primitive, batch.index_count, GL_UNSIGNED_INT, (void*)(&m_indices[0] + batch.index_start)))
+
+
+            if(batch.primitive == GL_POINTS)
+            {
+                spCheck(glDisable(GL_POINT_SPRITE_ARB))
+                spCheck(glDisable(GL_LINE_SMOOTH));
+                spCheck(glDisable(GL_POINT_SMOOTH));
+                spCheck(glDisable(GL_POLYGON_SMOOTH));
+                spCheck(glTexEnvi(GL_POINT_SPRITE_ARB, GL_COORD_REPLACE_ARB, GL_FALSE));
+                spCheck(glEnable(GL_BLEND))
+            }
+        }
+
+
+
+        spCheck(glPopAttrib())
+        spCheck(glPopClientAttrib());
+
+        m_framebuffer.display();
+
+        if(GL_ARB_multitexture_supported)
+        {
+            spCheck(glClientActiveTextureARB(GL_TEXTURE0_ARB))
+            spCheck(glActiveTextureARB(GL_TEXTURE0_ARB))
+        }
+        //m_custom_view.load();
+        spCheck(glBindTexture(GL_TEXTURE_2D, m_framebuffer.getTexHandleGL()))
+        spCheck(glVertexPointer(2, GL_FLOAT, 0, &frame_position[0]));
+        spCheck(glColorPointer(4, GL_UNSIGNED_BYTE, 0, &frame_color[0]));
+        spCheck(glTexCoordPointer(2, GL_FLOAT, 0, &frame_tex_coords[0]));
+        applyShader(m_post_process_shader);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 6);
+
+        cleanupDraw();
+    }
+}

@@ -1,0 +1,117 @@
+#ifndef SP_GLFW_CONTROLLER_H
+#define SP_GLFW_CONTROLLER_H
+#include <vector>
+#include <memory>
+#include <chrono>
+#include <functional>
+#include <unordered_map>
+
+#include <sp/sp.h>
+#include <sp/sp_event.h>
+#include <sp/math/rect.h>
+namespace sp
+{
+    class Listener;
+    class Subscription
+    {
+        public:
+                                Subscription() = default;
+                               ~Subscription() = default;
+
+            void                addListener(Listener* l);
+            void                removeListener(Listener* l);
+            void                broadcast(SP_Detail* detail);
+
+        private:
+            std::vector<Listener*>      m_listeners;
+    };
+
+    class Controller final
+    {
+        public:
+            typedef std::shared_ptr<Controller>             ptr;
+            typedef std::shared_ptr<const Controller>       const_ptr;
+
+            Controller&         operator=(const Controller&) = delete;
+            Controller&         operator=(Controller&&)      = delete;
+           ~Controller();
+
+            static bool         create(const SP_Config& = {});
+            static ptr          get();
+
+            bool                running() const;
+            void                applyView();
+
+            void                beginDraw();
+            void                endDraw();
+
+            void                subscribe(SP_SystemEvent event, Listener* listener);
+            void                unsubscribe(SP_SystemEvent event, Listener* listener);
+
+            void                mainLoop();
+            static const void*  getHandle();
+
+        private:
+            void                dispatch(SP_Detail* detail);
+        public:
+            template<typename T, typename ... Args>
+            void dispatch(SP_SystemEvent event, Args&& ... args)
+            {
+                T detail(event, std::forward<Args>(args)...);
+                dispatch(&detail);
+            }
+
+        private:
+                typedef std::function<void(SP_Detail*)>	Function;
+				void		init();
+
+				/**< can all be some Args&& thing.. >**/
+				/**< window events.. */
+				void		fnWindowPos(int xpos, int ypos);
+				void		fnWindowSize(int width, int height);
+				void		fnWindowClose();
+				void		fnWindowRefresh();
+				void		fnWindowFocus(int focused);
+				void		fnWindowIconify(int iconified);
+				void		fnWindowMaximize(int maximized);
+				void		fnWindowFramebufferSize(int width, int height);
+				void		fnWindowContentScale(int width, int height);
+
+				/**< input events.. */
+				void		fnKey(int key, int scancode, int action, int mods);
+				void		fnChar(unsigned int codepoint);
+				void		fnCharMods(unsigned int codepoint, int mods);
+				void		fnMouseButton(int button, int action, int mods);
+				void		fnCursorPos(double xpos, double ypos);
+				void		fnCursorEnter(int entered);
+				void		fnScroll(double xoffset, double yoffset);
+				void		fnDrop(int pathCount, const char* paths[]);
+
+        private:
+                                Controller();
+            static bool         initController(const SP_Config& config);
+            void                setDefaultCallbacks();
+            void                resetView(const sp::rectf& rect);
+
+            std::chrono::steady_clock::time_point   m_lastUpdateTime;
+
+            vec2f               m_center;
+            vec2i               m_size;
+
+
+            vec2f               m_lastMousePos;
+
+            std::unordered_map<SP_SystemEvent, Subscription>    m_subscriptions;
+            std::unordered_map<SPint32, SP_SystemEvent>         m_eventContainer;
+
+            static void*        m_window;
+            static void*        m_videoMode;
+            static void**       m_monitors;
+            static void*        m_primary;
+
+            bool                m_updateView{true};
+            bool                m_updateMatrix{true};
+    };
+}
+
+#endif // CONTROLLER_H
